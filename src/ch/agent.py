@@ -97,6 +97,18 @@ class Agent:
         if self.tools.whitelist is not None:
             self.tools.whitelist.add("remember_fact")
 
+    # ------------------------------------------------------------------ close
+    def close(self) -> None:
+        """释放持久化句柄（checkpoint / memory）。幂等，可安全重复调用。
+
+        为什么必须显式关：sqlite 连接在 Windows 上持有文件句柄，不关就删不掉库文件——
+        评测重复跑、Worker 回收都会踩到这个坑（实测 PermissionError: WinError 32）。
+        """
+        if self.checkpoint is not None and hasattr(self.checkpoint, "close"):
+            self.checkpoint.close()
+        if self.memory is not None:
+            self.memory.close()
+
     # ------------------------------------------------------------------ run
     def run(self, task: str, run_id: str | None = None, resume: bool = False) -> RunResult:
         run_id = run_id or new_id("run")

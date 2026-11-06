@@ -29,15 +29,36 @@ class LLM(Protocol):
         ...
 
 
-class OpenAICompatLLM:
-    """最小可用的 OpenAI 兼容客户端。"""
+class LLMError(RuntimeError):
+    """LLM 调用失败。retryable 标记该错误是否值得退避重试。"""
 
-    def __init__(self, cfg: Config, role: str = "main", timeout: float = 120.0):
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+# 429 限流、408/409/425 与 5xx 属于"稍后重试可能成功"；其余 4xx 是请求本身有问题，
+# 重试只会浪费时间与额度（真实模型按 token 计费）。
+_RETRYABLE_HTTP = {408, 409, 425, 429}
+
+
+def _retryable_http(code: int) -> bool:
+    return code in _RETRYABLE_HTTP or 500 <= code < 600
+
+
+class OpenAICompatLLM:
+    """最小可用的 OpenAI 兼容客户端：失败指数退避重试，空响应显式报错。"""
+
+    def __init__(self, cfg: Config, role: str = "main", timeout: float = 120.0,
+                 retries: int = 2, backoff_s: float = 0.5, max_backoff_s: float = 8.0):
         if cfg.offline:
             raise ValueError("Config 缺少 base_url/api_key/model，无法使用在线模型；请用 ScriptedLLM 或补全 .env")
         self.cfg = cfg
         self.role = role
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.backoff_s = max(0.0, float(backoff_s))
+        self.max_backoff_s = max(0.0, float(max_backoff_s))
         self.model_name = cfg.model if role == "main" else (cfg.small_model or cfg.model)
 
     def complete(self, messages: Sequence[Message], tools: list[dict] | None = None) -> LLMResponse:
@@ -60,16 +81,41 @@ class OpenAICompatLLM:
             },
             method="POST",
         )
+        last: LLMError | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                return self._send(req)
+            except LLMError as e:
+                last = e
+                if not e.retryable or attempt >= self.retries:
+                    raise
+                # 指数退避：0.5s → 1s → 2s ...，封顶 max_backoff_s
+                time.sleep(min(self.max_backoff_s, self.backoff_s * (2 ** attempt)))
+        raise last or LLMError("LLM 调用失败（未知原因）")
+
+    def _send(self, req: urllib.request.Request) -> LLMResponse:
         t0 = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:  # 4xx/5xx 要能看到服务端原文，便于排查
             detail = e.read().decode("utf-8", errors="replace")[:800]
-            raise RuntimeError(f"LLM HTTPError {e.code}: {detail}") from e
+            raise LLMError(f"LLM HTTPError {e.code}: {detail}", retryable=_retryable_http(e.code)) from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise LLMError(f"LLM 网络错误: {e}", retryable=True) from e
         latency = (time.perf_counter() - t0) * 1000
 
-        choice = (data.get("choices") or [{}])[0]
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise LLMError(f"LLM 返回非 JSON: {raw[:200]}", retryable=True) from e
+        choices = data.get("choices") or []
+        if not choices:
+            # 旧实现用 (choices or [{}])[0] 兜底，会把"服务端异常/限流"变成空回答，
+            # 下游只看到模型"什么都没说"，根因彻底丢失。
+            raise LLMError(f"LLM 返回空 choices（可能限流或服务端异常）：{raw[:200]}", retryable=True)
+
+        choice = choices[0]
         msg = choice.get("message") or {}
         raw_calls = msg.get("tool_calls") or []
         calls = [

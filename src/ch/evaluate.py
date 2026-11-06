@@ -184,7 +184,10 @@ def build_agent(variant: str, cfg: Config, llm: Any) -> Agent:
         # 配了 CH_EMBEDDING_MODEL 就用真实向量（带缓存与熔断），否则本地哈希
         memory = MemoryManager(cfg.db_path, context_budget=cfg.context_budget,
                                embedder=make_embedder(cfg))
-    tools = default_registry(root=".", approval=lambda n, a: False, whitelist={"calculator", "list_dir", "read_file"})
+    # 沙箱根固定为仓库根，而不是当前工作目录：list_dir/read_file 的输出长度直接
+    # 影响 token 指标，若跟着 cwd 漂移，"同一任务集换目录跑"就会得到两套数字。
+    tools = default_registry(root=str(REPO_ROOT), approval=lambda n, a: False,
+                             whitelist={"calculator", "list_dir", "read_file"})
     return Agent(router=router, tools=tools, cfg=cfg, memory=memory, tracer=Tracer())
 
 
@@ -207,8 +210,9 @@ def run_variant(
         try:
             res = agent.run(item.question)
         finally:
-            if agent.memory is not None:
-                agent.memory.close()
+            # close() 同时释放 checkpoint 与 memory；只关 memory 会漏掉 checkpoint 的
+            # sqlite 句柄，导致下一轮 unlink 库文件时报 WinError 32。
+            agent.close()
         m.outcomes.append(
             TaskOutcome(
                 task_id=item.id,
@@ -253,26 +257,63 @@ def compare(results: list[Metrics]) -> str:
     return "\n".join(lines)
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_TASKS = REPO_ROOT / "tasks" / "tasks.json"
+DEFAULT_OUT = REPO_ROOT / ".artifacts" / "eval.json"
+
+
+def _stable(m: "Metrics") -> dict[str, Any]:
+    """去掉墙钟耗时的指标快照，用于跨次比对可复现性。"""
+    return {k: v for k, v in m.summary().items() if k != "wall_ms"}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="ContextHarness 评测")
-    ap.add_argument("--tasks", default="tasks/tasks.json")
+    ap.add_argument("--tasks", default=str(DEFAULT_TASKS),
+                    help="任务集 JSON 路径；默认按包位置解析，与当前工作目录无关")
     ap.add_argument("--variants", nargs="+", default=["baseline", "budget", "full"])
     ap.add_argument("--online", action="store_true", help="接真实模型（需要 .env），否则用 script 回放")
-    ap.add_argument("--out", default="")
+    ap.add_argument("--repeat", type=int, default=1, help="每档重复次数；>1 时校验多次结果一致（可复现性）")
+    ap.add_argument("--out", default="", help=f"结果 JSON 路径；默认固定为 {DEFAULT_OUT}，便于 diff")
     args = ap.parse_args(argv)
 
-    tasks = load_tasks(args.tasks)
+    if args.repeat < 1:
+        print("--repeat 必须 >= 1", file=sys.stderr)
+        return 2
+    try:
+        tasks = load_tasks(args.tasks)
+    except FileNotFoundError:
+        print(f"找不到任务集：{args.tasks}\n可用 --tasks 指定 tasks.json 路径。", file=sys.stderr)
+        return 2
+    except (json.JSONDecodeError, KeyError, OSError) as e:
+        print(f"任务集读取失败：{args.tasks}：{type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    if not tasks:
+        print(f"任务集为空：{args.tasks}", file=sys.stderr)
+        return 2
+
     factory = None
     if not args.online:
         factory = lambda item: ScriptedLLM(item.script)  # noqa: E731
 
-    results = [run_variant(v, tasks, factory) for v in args.variants]
+    results: list[Metrics] = []
+    for r in range(args.repeat):
+        one = [run_variant(v, tasks, factory) for v in args.variants]
+        if r == 0:
+            results = one
+            continue
+        # 可复现性断言：同一任务集重复跑，指标必须逐字段一致（wall_ms 是墙钟耗时，天然抖动，不参与比较）
+        if [_stable(m) for m in one] != [_stable(m) for m in results]:
+            print(f"第 {r + 1} 次结果与前次不一致，评测不可复现：", file=sys.stderr)
+            print(compare(one), file=sys.stderr)
+            return 1
     print(compare(results))
 
-    out = args.out or f".artifacts/eval-{int(time.time())}.json"
+    out = args.out or str(DEFAULT_OUT)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(
-        json.dumps({"results": [r.to_dict() for r in results]}, ensure_ascii=False, indent=2),
+        json.dumps({"repeat": args.repeat, "results": [r.to_dict() for r in results]},
+                   ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(f"\n明细已写入 {out}")

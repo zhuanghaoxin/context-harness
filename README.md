@@ -8,7 +8,7 @@ python examples/run_mock.py                       # 离线跑通全部机制（�
 # 让 python -m ch.* 找得到源码（Windows PowerShell）
 $env:PYTHONPATH='src'        #  bash/zsh: export PYTHONPATH=src ；也可以 pip install -e .
 
-python -m unittest discover -s tests -t .         # 93 个单测
+python -m unittest discover -s tests -t .         # 105 个单测
 python -m ch.evaluate --variants baseline budget full   # 消融对照（离线回放）
 ```
 
@@ -63,10 +63,11 @@ python -m ch.evaluate --variants baseline budget full   # 消融对照（离线�
 | Token 预算分配器 | `src/ch/budget.py` | 四类配额 + 按优先级裁剪（先截记忆 → 整组丢最旧 → 硬截断大 tool 输出） | 上下文窗口怎么分配？Lost in the Middle 怎么缓解？为什么按「组」丢而不是按消息丢？ |
 | 工具输出压缩 | `src/ch/compress.py` | 头 60% + 标记 + 尾，全文归档到 `.artifacts/`，消息里留 ref 可回查 | tool result 爆炸怎么办？压缩丢了关键信息怎么恢复？ |
 | 三层记忆 | `src/ch/memory.py` | 工作记忆=上下文；情景记忆=向量检索；语义记忆=去重/冲突更新/时间衰减 | Mem0/Zep 的差别？事实冲突谁赢？遗忘曲线怎么实现？ |
-| 状态持久化 | `src/ch/checkpoint.py` | 每步落盘，`resume=True` 续跑，DAG 节点级 completed 跳过 | 长任务断点续跑、幂等、回滚怎么做？ |
-| DAG 编排 | `src/ch/dag.py` | 三色 DFS 环检测 + 拓扑分层 + 上游输出注入 | 为什么先做确定性 DAG 不做自主规划？（预算可控/可复现/好评测） |
+| 状态持久化 | `src/ch/checkpoint.py` | 每步落盘，`resume=True` 续跑，DAG 节点级 completed 跳过，失败落 `failed`、下游落 `skipped` | 长任务断点续跑、幂等、回滚怎么做？ |
+| DAG 编排 | `src/ch/dag.py` | 三色 DFS 环检测 + 拓扑分层 + 上游输出按 token 预算注入 + `resume=True` 透传给节点 | 为什么先做确定性 DAG 不做自主规划？（预算可控/可复现/好评测） |
 | Skill / MCP | `src/ch/skill.py`、`src/ch/mcp_client.py` | Skill 四要素（功能/输入 Schema/输出 Schema/依赖工具）；最小 MCP stdio 客户端（JSON-RPC 2.0 握手） | MCP 和 Skill 的区别？协议握手流程？依赖缺失怎么处理？ |
-| 可观测 + 评估 | `src/ch/trace.py`、`src/ch/evaluate.py` | 每步 token/成本/延迟/工具；任务集 checker；多档消融 | 怎么评估一个 Agent？成本和通过率怎么同时看？ |
+| LLM 客户端 | `src/ch/llm.py` | 429/5xx/超时/网络抖动指数退避重试；4xx 不重试；空 `choices` 显式报错而不是返回空回答 | 服务端抖动怎么处理？重试会不会放大成本？ |
+| 可观测 + 评估 | `src/ch/trace.py`、`src/ch/evaluate.py` | 每步 token/成本/延迟/工具；任务集 checker；多档消融；`--repeat N` 校验可复现 | 怎么评估一个 Agent？成本和通过率怎么同时看？ |
 
 ## 3.5 Super-agent v2：Router–Worker 双层
 
@@ -152,6 +153,9 @@ embedding 端点可以和 chat 端点分开（`CH_EMBEDDING_BASE_URL` / `CH_EMBE
 # 离线回放：验证管线正确性（指标口径、停机原因、checker、裁剪是否生效）
 python -m ch.evaluate --tasks tasks/tasks.json --variants baseline budget full
 
+# 可复现性自检：同任务集重复 3 次，指标必须逐字段一致（不一致直接非零退出）
+python -m ch.evaluate --variants baseline budget full --repeat 3
+
 # v2：单 loop 串行 vs Filter+Router+WorkerPool 双层对照
 python examples/run_super.py
 
@@ -161,7 +165,7 @@ python -m ch.evaluate --variants baseline budget full --online --out .artifacts/
 python examples/run_super.py --online
 ```
 
-指标：`pass_rate / tokens_per_task / cost_per_task / avg_steps / stop_reasons`，明细写到 `.artifacts/eval-*.json`（含每条任务的回答，便于坏 case 归因）。
+指标：`pass_rate / tokens_per_task / cost_per_task / avg_steps / stop_reasons`，明细默认写到 `.artifacts/eval.json`（固定名，便于两次运行直接 diff；含每条任务的回答，便于坏 case 归因），`--out` 可改路径。`--tasks` 默认按包位置解析，换目录跑不会找不到任务集；沙箱根固定为仓库根，因此**指标与 cwd 无关**。
 
 > ⚠️ 离线回放用 `ScriptedLLM` 重放 `tasks.json` 里的 `script`，所以通过率一定是满的——它验证的是**管线**，不是模型效果。对外引用的数字必须来自 `--online`。
 
@@ -200,7 +204,8 @@ context-harness/
 ├── tests/test_smoke.py    40 个单测（v1）
 ├── tests/test_super.py    23 个单测（filter / watchdog / router / supervisor）
 ├── tests/test_async_embed.py  20 个单测（远端 embedding / 熔断 / 维度守卫 / 异步 Worker / 续跑）
-└── tests/test_p0_hardening.py 9 个单测（预算配额 / 中文裁剪 / ref 逃逸 / 沙箱 / checkpoint 并发）
+├── tests/test_p0_hardening.py 9 个单测（预算配额 / 中文裁剪 / ref 逃逸 / 沙箱 / checkpoint 并发）
+└── tests/test_resilience.py   12 个单测（LLM 退避重试 / 空 choices / DAG 续跑与 failed-skipped / 评测 CLI 可复现）
 ```
 
 ## 6. 设计决策与取舍

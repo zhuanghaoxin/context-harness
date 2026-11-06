@@ -14,8 +14,24 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .agent import Agent
+from .budget import truncate_to_tokens
 from .config import Config
 from .types import RunResult
+
+# 上游节点输出注入下游时的 token 预算（此前是 [:2000] 字符硬切，中文会超预算且切口随机）
+UPSTREAM_TOKEN_BUDGET = 800
+
+
+class DAGRunError(RuntimeError):
+    """有节点失败：失败节点已落库为 failed，下游落库为 skipped。"""
+
+    def __init__(self, message: str, failures: dict[str, Exception], skipped: list[str],
+                 outputs: dict[str, str], results: dict[str, RunResult]):
+        super().__init__(message)
+        self.failures = failures
+        self.skipped = skipped
+        self.outputs = outputs
+        self.results = results
 
 
 @dataclass
@@ -89,28 +105,62 @@ class DAG:
         results: dict[str, RunResult] = {}
         prev_status = checkpoint.node_status(dag_id) if (checkpoint and resume) else {}
 
+        completed: set[str] = set()
+        failed: dict[str, Exception] = {}
+        skipped: list[str] = []
         for layer in self.layers():
             for name in layer:
                 node = self.nodes[name]
                 if prev_status.get(name, ("", ""))[0] == "completed":
                     outputs[name] = prev_status[name][1]
+                    completed.add(name)
+                    continue
+
+                # 依赖没全部完成（上游失败或被跳过）→ 本节点不执行，落 skipped 而不是静默跳过
+                if any(d not in completed for d in node.deps):
+                    skipped.append(name)
+                    if checkpoint is not None:
+                        checkpoint.mark_node(dag_id, name, "skipped", "上游节点未完成")
                     continue
 
                 task = node.task
                 if node.deps:
-                    ctx = "\n\n".join(
-                        f"### {d} 的输出\n{outputs.get(d, '')[:2000]}" for d in node.deps
-                    )
+                    parts: list[str] = []
+                    for d in node.deps:
+                        shown = truncate_to_tokens(
+                            outputs.get(d, ""),
+                            UPSTREAM_TOKEN_BUDGET,
+                            marker="\n...[上游输出已按预算截断]",
+                        )
+                        parts.append(f"### {d} 的输出\n{shown}")
+                    ctx = "\n\n".join(parts)
                     task = (node.template or "{ctx}\n\n任务：{task}").format(ctx=ctx, task=node.task)
 
-                agent = agent_factory(node)
-                res = agent.run(task, run_id=f"{dag_id}:{name}")
+                try:
+                    agent = agent_factory(node)
+                    # resume 透传给 Agent：节点内部半途中断时，重跑从断点继续而不是重放工具
+                    res = agent.run(task, run_id=f"{dag_id}:{name}", resume=resume)
+                except Exception as e:  # noqa: BLE001 - 节点失败要落库并让下游跳过，而不是裸抛
+                    failed[name] = e
+                    if checkpoint is not None:
+                        checkpoint.mark_node(dag_id, name, "failed", f"{type(e).__name__}: {e}"[:500])
+                    continue
+
                 outputs[name] = res.answer
                 results[name] = res
+                completed.add(name)
                 if checkpoint is not None:
                     checkpoint.mark_node(dag_id, name, "completed", res.answer)
 
-        return {"outputs": outputs, "results": results, "dag_id": dag_id}
+        if failed:
+            raise DAGRunError(
+                f"DAG {dag_id} 有 {len(failed)} 个节点失败：{sorted(failed)}；已跳过下游 {skipped}",
+                failures=failed,
+                skipped=skipped,
+                outputs=outputs,
+                results=results,
+            )
+        return {"outputs": outputs, "results": results, "dag_id": dag_id, "skipped": skipped}
 
     def mermaid(self) -> str:
         lines = ["graph TD"]
