@@ -1,0 +1,108 @@
+{
+  "_comment": "自建任务集。script 字段仅用于离线回放（验证管线），接真实模型时会被忽略。",
+  "tasks": [
+    {
+      "id": "calc-01",
+      "question": "算一下 (128 + 64) * 3 等于多少。",
+      "checker": { "type": "numeric", "value": [576] },
+      "script": [
+        { "tool": "calculator", "args": { "expr": "(128 + 64) * 3" } },
+        { "text": "结果：576" }
+      ],
+      "tags": ["tool-use", "easy"]
+    },
+    {
+      "id": "calc-02",
+      "question": "如果一个 agent 每步平均消耗 1200 token，跑 40 步，总 token 是多少？",
+      "checker": { "type": "numeric", "value": [48000] },
+      "script": [
+        { "tool": "calculator", "args": { "expr": "1200 * 40" } },
+        { "text": "总 token = 48000" }
+      ],
+      "tags": ["tool-use", "easy"]
+    },
+    {
+      "id": "calc-03",
+      "question": "把 token 从 48000 降到 31000，降幅百分比是多少（保留一位小数）？",
+      "checker": { "type": "contains", "value": "35.4" },
+      "script": [
+        { "tool": "calculator", "args": { "expr": "(48000 - 31000) / 48000 * 100" } },
+        { "text": "降幅约 35.4%" }
+      ],
+      "tags": ["reasoning", "multi-step"]
+    },
+    {
+      "id": "err-01",
+      "question": "计算 3 的平方根乘以 10000（保留整数）。",
+      "checker": { "type": "numeric", "value": [10000], "tol": 10000 },
+      "script": [
+        { "tool": "calculator", "args": { "expr": "3 ** 0.5" } },
+        { "tool": "calculator", "args": { "expr": "1.7320508 * 10000" } },
+        { "text": "约等于 17321" }
+      ],
+      "tags": ["tool-use", "error-recovery"]
+    },
+    {
+      "id": "loop-01",
+      "question": "读一下 README 里关于 token 预算的说明。",
+      "checker": { "type": "contains", "value": "预算" },
+      "script": [
+        { "tool": "read_file", "args": { "path": "README.md" } },
+        { "tool": "read_file", "args": { "path": "README.md" } },
+        { "tool": "read_file", "args": { "path": "README.md" } },
+        { "text": "README 里说明了 token 预算的分配与裁剪策略。" }
+      ],
+      "tags": ["loop-guard"]
+    },
+    {
+      "id": "mem-01",
+      "question": "记住：我的项目默认上下文预算是 8000 token。然后告诉我记住了什么。",
+      "checker": { "type": "contains", "value": "8000" },
+      "script": [
+        { "tool": "remember_fact", "args": { "key": "项目默认上下文预算", "value": "8000 token" } },
+        { "text": "已记住：项目默认上下文预算 = 8000 token。" }
+      ],
+      "tags": ["memory"]
+    },
+    {
+      "id": "mem-02",
+      "question": "我的项目默认上下文预算是多少？",
+      "checker": { "type": "contains", "value": "8000" },
+      "script": [{ "text": "根据记忆：项目默认上下文预算 = 8000 token。" }],
+      "tags": ["memory", "recall-only"]
+    },
+    {
+      "id": "mem-03",
+      "question": "更正一下：默认上下文预算改成 2500 token。",
+      "checker": { "type": "contains", "value": "2500" },
+      "script": [
+        { "tool": "remember_fact", "args": { "key": "项目默认上下文预算", "value": "2500 token" } },
+        { "text": "已更新为 2500 token。" }
+      ],
+      "tags": ["memory", "conflict-update"]
+    },
+    {
+      "id": "bad-arg-01",
+      "question": "用 calculator 计算 7*7，注意参数格式。",
+      "checker": { "type": "numeric", "value": [49] },
+      "script": [
+        { "tool": "calculator", "args": {} },
+        { "tool": "calculator", "args": { "expr": "7*7" } },
+        { "text": "7*7 = 49" }
+      ],
+      "tags": ["schema-validation", "error-recovery"]
+    },
+    {
+      "id": "long-01",
+      "question": "分三步估算：若 40 条任务里 25 条通过，通过率多少？再假设优化后 31 条通过，提升多少个百分点？",
+      "checker": { "type": "all", "value": [{ "type": "contains", "value": "62.5" }, { "type": "contains", "value": "77.5" }] },
+      "script": [
+        { "tool": "calculator", "args": { "expr": "25 / 40 * 100" } },
+        { "tool": "calculator", "args": { "expr": "31 / 40 * 100" } },
+        { "tool": "calculator", "args": { "expr": "77.5 - 62.5" } },
+        { "text": "优化前 62.5%，优化后 77.5%，提升 15 个百分点。" }
+      ],
+      "tags": ["multi-step", "long-horizon"]
+    }
+  ]
+}

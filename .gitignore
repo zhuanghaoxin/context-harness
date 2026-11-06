@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.sqlite
+*.sqlite3
+.artifacts/
+.pytest_cache/
+runs/
+dist/
+build/
+*.egg-info/
+
+# Local private material is kept outside this repo and must never be committed.
+_private/
+*.local.md
+private-notes/
+local-notes/

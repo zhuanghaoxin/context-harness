@@ -1,0 +1,33 @@
+name: content-guard
+
+# Blocks job-seeking wording (Chinese terms for interview / resume / job hunt)
+# from ever landing in this public repository. The pattern itself is assembled
+# from code points so this file never matches its own guard.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  content-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Scan tracked files for job-seeking wording
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern="$(python -c "print(''.join(map(chr,(0x9762,0x8bd5)))+'|'+''.join(map(chr,(0x7b80,0x5386)))+'|'+''.join(map(chr,(0x6c42,0x804c))))")"
+          if git grep -nE "$pattern" -- . ; then
+            echo "::error::Found job-seeking wording (interview/resume/job-hunt). Rewrite it as engineering wording."
+            exit 1
+          fi
+          echo "content-guard: clean"

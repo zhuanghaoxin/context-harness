@@ -1,0 +1,33 @@
+name: ci
+
+# Zero runtime dependencies: the suite runs on a bare CPython, no pip install step.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Unit tests (no PYTHONPATH, exercises the sys.path bootstrap)
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Offline examples
+        run: |
+          python examples/run_mock.py
+          python examples/run_async.py
+          python examples/run_super.py
