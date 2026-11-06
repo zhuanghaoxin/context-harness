@@ -86,7 +86,7 @@ python examples/run_super.py --online
 # 离线：不花钱，验证机制
 python examples/run_mock.py
 python examples/run_async.py
-python -m unittest discover -s tests -t .      # 105 个单测
+python -m unittest discover -s tests -t .      # 120 个单测
 ```
 
 ## 5. 跑数字过程中被数字抓出来的 bug

@@ -19,6 +19,9 @@ import subprocess
 import threading
 from typing import Any
 
+from . import __version__
+from .tools import ToolRegistry, ToolSpec
+
 PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -57,7 +60,7 @@ class MCPClient:
             {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "context-harness", "version": "0.1.0"},
+                "clientInfo": {"name": "context-harness", "version": __version__},
             },
         )
         self.server_info = resp.get("result", {}).get("serverInfo", {})
@@ -65,12 +68,19 @@ class MCPClient:
         return self
 
     def close(self) -> None:
-        if self.proc and self.proc.poll() is None:
+        """幂等关闭：先断 stdin 让服务端自己退出，再兜底 terminate，最后回收子进程。"""
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
             try:
-                self.proc.stdin and self.proc.stdin.close()
+                if self.proc.stdin:
+                    self.proc.stdin.close()
                 self.proc.terminate()
+                self.proc.wait(timeout=2)
             except Exception:
                 pass
+        if self._reader is not None and self._reader.is_alive():
+            self._reader.join(timeout=1)
 
     def __enter__(self) -> "MCPClient":
         return self.start()
@@ -101,8 +111,9 @@ class MCPClient:
                     self._pending[mid] = msg
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        self._next_id += 1
-        mid = self._next_id
+        with self._lock:
+            self._next_id += 1
+            mid = self._next_id
         self._send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params or {}})
         waited = 0.0
         step = 0.02
@@ -150,3 +161,28 @@ class MCPClient:
                 }
             )
         return out
+
+    def install_into(self, registry: ToolRegistry, *, dangerous: bool = True) -> int:
+        """把服务端工具并入本地工具表，返回注册数量。
+
+        在此之前 MCP 客户端只是个"能说协议"的孤岛：schema 能列出来，却没有任何
+        路径让它变成 agent 真能调用的工具。默认 dangerous=True —— 外部进程的行为
+        本地无法审计，必须走审批；要自动放行由调用方显式传 dangerous=False。
+        """
+        count = 0
+        for schema in self.to_openai_schemas():
+            fn = schema["function"]
+            name = fn.get("name") or ""
+            if not name:
+                continue
+            registry.register(
+                ToolSpec(
+                    name=name,
+                    description=fn.get("description", ""),
+                    parameters=fn.get("parameters") or {"type": "object", "properties": {}},
+                    func=lambda _name=name, **kwargs: self.call_tool(_name, kwargs),
+                    dangerous=dangerous,
+                )
+            )
+            count += 1
+        return count

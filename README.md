@@ -8,7 +8,7 @@ python examples/run_mock.py                       # 离线跑通全部机制（�
 # 让 python -m ch.* 找得到源码（Windows PowerShell）
 $env:PYTHONPATH='src'        #  bash/zsh: export PYTHONPATH=src ；也可以 pip install -e .
 
-python -m unittest discover -s tests -t .         # 105 个单测
+python -m unittest discover -s tests -t .         # 120 个单测
 python -m ch.evaluate --variants baseline budget full   # 消融对照（离线回放）
 ```
 
@@ -129,6 +129,8 @@ embedding 端点可以和 chat 端点分开（`CH_EMBEDDING_BASE_URL` / `CH_EMBE
 
 > 注意：`WorkerStore` 存的是**元信息**，执行进度在 `checkpoint.runs`。两边都存进度会打架，这是拆分时先定死的边界。
 
+**④ 可观测性**：`CH_LOG_LEVEL=INFO` 打开运行期日志（默认 `WARNING`，不污染演示输出）。每次 run 记 start/stop（停机原因、步数、prompt/completion tokens、成本），LLM 重试记 `第 n/2 次重试（0.5s 后）`。配置项由 `Config.validate()` 逐项校验：`CH_MAX_STEPS=abc` 报的是 `CH_MAX_STEPS='abc' 不是合法整数`，而不是裸 `ValueError`；多个字段同时非法会一次报全。
+
 ## 4. 评测：把「我觉得更好」变成数字
 
 三档消融（`src/ch/evaluate.py`）：
@@ -176,7 +178,8 @@ context-harness/
 ├── src/ch/
 │   ├── types.py       消息/ToolCall/ToolResult/RunResult 等数据结构
 │   ├── tokens.py      中英混排估 token（CJK 1 字/token，其余 4 字符/token）
-│   ├── config.py      环境变量/成本表/预算份额
+│   ├── config.py      环境变量逐项校验（非法值报变量名）+ 成本表/预算份额
+│   ├── log.py         统一日志入口（CH_LOG_LEVEL，默认 WARNING）
 │   ├── budget.py      上下文预算分配与裁剪
 │   ├── compress.py    工具输出压缩 + 归档回查
 │   ├── memory.py      三层记忆（embedding 可插拔 + sqlite）
@@ -202,10 +205,13 @@ context-harness/
 ├── examples/run_async.py  异步提交 + 换进程读状态 + 断点续跑演示
 ├── examples/check_online.py  连通性自检（chat + embeddings，确认 key/端点）
 ├── tests/test_smoke.py    40 个单测（v1）
-├── tests/test_super.py    23 个单测（filter / watchdog / router / supervisor）
+├── tests/test_super.py    24 个单测（filter / watchdog / router / supervisor）
 ├── tests/test_async_embed.py  20 个单测（远端 embedding / 熔断 / 维度守卫 / 异步 Worker / 续跑）
-├── tests/test_p0_hardening.py 9 个单测（预算配额 / 中文裁剪 / ref 逃逸 / 沙箱 / checkpoint 并发）
-└── tests/test_resilience.py   12 个单测（LLM 退避重试 / 空 choices / DAG 续跑与 failed-skipped / 评测 CLI 可复现）
+├── tests/test_p0_hardening.py 10 个单测（预算配额 / 中文裁剪 / ref 逃逸 / 沙箱 / checkpoint 并发）
+├── tests/test_resilience.py   12 个单测（LLM 退避重试 / 空 choices / DAG 续跑与 failed-skipped / 评测 CLI 可复现）
+├── tests/test_run_resume.py   2 个单测（续跑账目连续 / 工具副作用按签名回放）
+├── tests/test_mcp_client.py   4 个单测（stdio 握手 / id 唯一 / install_into 接线 / 超时与错误）
+└── tests/test_config_log.py   8 个单测（环境变量逐项校验 / 一次报全 / 运行期日志）
 ```
 
 ## 6. 设计决策与取舍

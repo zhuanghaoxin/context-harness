@@ -244,7 +244,9 @@ class Supervisor:
                     # Worker 由 Router 建好（NEW_WORKER 时新建，REUSE 时复用同一个），这里只负责跑
                     w = pool.workers[decision.worker_id]  # type: ignore[index]
                     it.worker_id = w.id
-                    fut = ex.submit(self._exec, w, it)
+                    # REUSE 的语义是"接着这个 Worker 已有的上下文继续跑"，
+                    # 所以必须 resume=True，否则会把基础任务整个重做一遍。
+                    fut = ex.submit(self._exec, w, it, decision.action == REUSE_WORKER)
                     futures[fut] = it
                     running += 1
                     pool.peak_concurrency = max(pool.peak_concurrency, self._busy(pool))
@@ -267,13 +269,13 @@ class Supervisor:
     def _busy(pool: WorkerPool) -> int:
         return sum(1 for w in pool.workers.values() if w.status == "running")
 
-    def _exec(self, worker: Any, item: WorkItem) -> None:
+    def _exec(self, worker: Any, item: WorkItem, resume: bool = False) -> None:
         """在 Worker 线程里跑一个 loop，结果写回 WorkItem。异常不外抛。"""
         with self._lock:
             self._inflight += 1
             self._peak_inflight = max(self._peak_inflight, self._inflight)
         try:
-            res = worker.run()
+            res = worker.run(resume=resume)
             if res is None:
                 item.status = "failed"
                 item.note = worker.error or "worker returned None"

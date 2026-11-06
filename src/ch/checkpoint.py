@@ -70,6 +70,14 @@ class CheckpointStore:
                        dag_id TEXT, node TEXT, status TEXT, output TEXT, updated_ts REAL,
                        PRIMARY KEY(dag_id, node))"""
             )
+            # 工具结果表：idempotency key = (run_id, step, 调用序号:签名)。
+            # 为什么需要：工具副作用发生在"步末保存"之前，进程在步中崩溃后重跑，
+            # 模型会重新发出同一批调用——没有这张表就会把非幂等操作（写文件、发消息）执行两遍。
+            self.conn.execute(
+                """CREATE TABLE IF NOT EXISTS tool_results(
+                       run_id TEXT, step INTEGER, sig TEXT, result TEXT, updated_ts REAL,
+                       PRIMARY KEY(run_id, step, sig))"""
+            )
             self.conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -117,6 +125,24 @@ class CheckpointStore:
             return self._conn().execute(
                 "SELECT run_id, step, task, updated_ts FROM runs ORDER BY updated_ts DESC LIMIT ?", (limit,)
             ).fetchall()
+
+    # ------------------------------------------------------------- tool results
+    def save_tool_result(self, run_id: str, step: int, sig: str, result: dict[str, Any]) -> None:
+        """记下某一步某次工具调用的结果，供续跑时回放（不再真正执行工具）。"""
+        with self._lock:
+            conn = self._conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO tool_results(run_id, step, sig, result, updated_ts) VALUES (?,?,?,?,?)",
+                (run_id, step, sig, json.dumps(result, ensure_ascii=False), time.time()),
+            )
+            conn.commit()
+
+    def load_tool_result(self, run_id: str, step: int, sig: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn().execute(
+                "SELECT result FROM tool_results WHERE run_id=? AND step=? AND sig=?", (run_id, step, sig)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
 
     # ------------------------------------------------------------- dag nodes
     def mark_node(self, dag_id: str, node: str, status: str, output: str = "") -> None:

@@ -22,12 +22,15 @@ from .checkpoint import CheckpointStore
 from .compress import ToolOutputCompressor
 from .config import Config
 from .llm import Router
+from .log import get_logger
 from .memory import MemoryManager
 from .tools import ToolRegistry, ToolSpec
 from .trace import Tracer
-from .types import Message, RunResult, StepRecord, Usage, new_id
+from .types import Message, RunResult, StepRecord, ToolResult, Usage, new_id
 from .tokens import estimate, estimate_messages
 from .watchdog import ABORT as WD_ABORT
+
+log = get_logger("agent")
 from .watchdog import REMIND_GOAL as WD_REMIND
 from .watchdog import Watchdog
 
@@ -110,8 +113,10 @@ class Agent:
             self.memory.close()
 
     # ------------------------------------------------------------------ run
-    def run(self, task: str, run_id: str | None = None, resume: bool = False) -> RunResult:
+    def run(self, task: str, run_id: str | None = None, resume: bool = False,
+            extra: str | None = None) -> RunResult:
         run_id = run_id or new_id("run")
+        log.info("run %s start resume=%s task=%r", run_id, resume, task[:80])
         pinned = [Message(role="system", content=SYSTEM_PROMPT, pinned=True),
                   Message(role="user", content=task, pinned=True)]
         history: list[Message] = []
@@ -121,13 +126,32 @@ class Agent:
         stop_reason = "max_steps"
         answer = ""
 
+        repeat_counts: dict[str, int] = {}
+        loaded = False
         if resume and self.checkpoint is not None:
             snap = self.checkpoint.load(run_id)
             if snap is not None:
+                loaded = True
                 pinned, history = snap.pinned, snap.history
                 step = snap.step
+                # 账目必须一起恢复：只恢复历史会让续跑后的 usage/cost 从 0 起算，
+                # 对外披露的"单任务成本"在续跑场景下就是错的。
+                meta = snap.meta or {}
+                u = meta.get("usage") or {}
+                usage = Usage(
+                    prompt_tokens=int(u.get("prompt_tokens") or 0),
+                    completion_tokens=int(u.get("completion_tokens") or 0),
+                )
+                cost = float(meta.get("cost") or 0.0)
+                repeat_counts = {str(k): int(v) for k, v in (meta.get("repeat_counts") or {}).items()}
 
-        repeat_counts: dict[str, int] = {}
+        # 「消息直达」的落地方式：同一 Worker 收到补充消息时不重建上下文，
+        # 而是把新消息接到已有 history 后面继续跑；没有历史可续时退化成合并任务。
+        if extra:
+            if loaded:
+                history.append(Message(role="user", content=extra))
+            else:
+                pinned[-1] = Message(role="user", content=f"{task}\n补充：{extra}", pinned=True)
         memory_block = ""
         if self.memory is not None:
             memory_block = self.memory.recall_block(task, budget_tokens=int(self.cfg.context_budget * 0.15))
@@ -180,11 +204,30 @@ class Agent:
             # 执行工具（串行；并行执行见 README 的 roadmap）
             history.append(Message(role="assistant", content=resp.message.content, tool_calls=resp.message.tool_calls))
             step_sigs: list[str] = []
-            for call in resp.message.tool_calls:
-                result = self.tools.call(call.name, call.arguments, call.id)
-
-                # 重复调用检测
+            for idx, call in enumerate(resp.message.tool_calls):
+                # 重复调用签名（也用作工具结果的幂等键的一部分）
                 sig = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)}"
+                replay_key = f"{idx}:{sig}"
+                cached = None
+                if self.checkpoint is not None:
+                    cached = self.checkpoint.load_tool_result(run_id, step, replay_key)
+
+                if cached is not None:
+                    # 续跑回放：这一步的工具副作用在执行时已经发生过，
+                    # 重跑不能再来一次（写文件/发消息不幂等），直接用当时的结果续上。
+                    result = ToolResult(
+                        call.id,
+                        call.name,
+                        bool(cached.get("ok")),
+                        output=cached.get("output") or "",
+                        error=cached.get("error"),
+                        omitted_chars=int(cached.get("omitted_chars") or 0),
+                        ref=cached.get("ref"),
+                    )
+                    self.tracer.note(f"replay tool result: {call.name} (step {step})")
+                else:
+                    result = self.tools.call(call.name, call.arguments, call.id)
+
                 repeat_counts[sig] = repeat_counts.get(sig, 0) + 1
                 if repeat_counts[sig] == self.cfg.repeat_limit:
                     result.output = (result.output or "") + (
@@ -195,9 +238,13 @@ class Agent:
                     stop_reason = "repeated_tool"
                     answer = f"检测到重复调用 {call.name}，已停机以避免无效消耗。"
                     self.tracer.note(f"repeated tool call: {sig}")
-                    return self._finish(run_id, task, answer, stop_reason, step, usage, cost, history)
+                    return self._finish(
+                        run_id, task, answer, stop_reason, step, usage, cost, history,
+                        pinned=pinned, repeat_counts=repeat_counts,
+                    )
 
-                # 工具输出压缩（超额度才动）
+                # 工具输出压缩（超额度才动）：压缩后的文本才是续跑回放的内容，
+                # 否则回放会重新压缩、结果与首次执行不一致。
                 if result.ok and estimate(result.output) > 600:
                     head_tokens = estimate_messages(
                         pinned + [Message(role="system", content=memory_block)] + history
@@ -207,6 +254,18 @@ class Agent:
                     result.output = squeezed.text
                     result.omitted_chars = squeezed.omitted_chars
                     result.ref = squeezed.ref
+
+                if cached is None and self.checkpoint is not None:
+                    self.checkpoint.save_tool_result(
+                        run_id, step, replay_key,
+                        {
+                            "ok": result.ok,
+                            "output": result.output,
+                            "error": result.error,
+                            "omitted_chars": result.omitted_chars,
+                            "ref": result.ref,
+                        },
+                    )
 
                 history.append(result.to_message())
                 # Watchdog 的"停滞"签名要包含**输出**：同一个调用失败一次后重试、
@@ -227,7 +286,10 @@ class Agent:
                 stop_reason = f"watchdog:{directive.reason}"
                 answer = f"Watchdog 停机（{directive.reason}）：{directive.detail}"
                 self.tracer.note(f"watchdog abort: {directive.detail}")
-                return self._finish(run_id, task, answer, stop_reason, step, usage, cost, history)
+                return self._finish(
+                    run_id, task, answer, stop_reason, step, usage, cost, history,
+                    pinned=pinned, repeat_counts=repeat_counts,
+                )
             if directive.action == WD_REMIND:
                 history.append(
                     Message(
@@ -239,10 +301,18 @@ class Agent:
             if self.checkpoint is not None:
                 self.checkpoint.save(
                     run_id, step, task, pinned, history,
-                    meta={"usage": usage.to_dict(), "cost": cost},
+                    meta={
+                        "usage": usage.to_dict(),
+                        "cost": cost,
+                        "repeat_counts": repeat_counts,
+                        "stop_reason": stop_reason,
+                    },
                 )
 
-        return self._finish(run_id, task, answer, stop_reason, step, usage, cost, history)
+        return self._finish(
+            run_id, task, answer, stop_reason, step, usage, cost, history,
+            pinned=pinned, repeat_counts=repeat_counts,
+        )
 
     def _finish(
         self,
@@ -254,13 +324,31 @@ class Agent:
         usage: Usage,
         cost: float,
         history: list[Message],
+        pinned: list[Message] | None = None,
+        repeat_counts: dict[str, int] | None = None,
     ) -> RunResult:
+        # 早退路径（repeated_tool / watchdog / final / error）也要落盘：
+        # 不保存的话，续跑会从更早的 step 重来，已经付过的 token 和已发生的副作用都对不上账。
+        if self.checkpoint is not None and pinned is not None:
+            self.checkpoint.save(
+                run_id, step, task, pinned, history,
+                meta={
+                    "usage": usage.to_dict(),
+                    "cost": cost,
+                    "repeat_counts": repeat_counts or {},
+                    "stop_reason": stop_reason,
+                },
+            )
         # 把本次 episode 写入情景记忆，供后续同名任务召回
         if self.memory is not None and answer:
             self.memory.record_episode(
                 f"任务：{task[:200]}\n结论：{answer[:400]}",
                 meta={"run_id": run_id, "stop_reason": stop_reason},
             )
+        log.info(
+            "run %s stop=%s steps=%d prompt_tokens=%d completion_tokens=%d cost=%.6f",
+            run_id, stop_reason, step, usage.prompt_tokens, usage.completion_tokens, cost,
+        )
         return RunResult(
             answer=answer,
             stop_reason=stop_reason,

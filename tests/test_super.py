@@ -187,8 +187,42 @@ class TestRouterWorker(unittest.TestCase):
         self.assertEqual(d2.worker_id, d1.worker_id)
         w = self.pool.workers[d2.worker_id]
         self.assertEqual(len(w.messages), 1)
-        self.assertIn("504", w.task)  # 消息直达：拼进 Worker 自己的任务，不重建上下文
+        # 补充消息进入待消费队列，复用时接在已有上下文后面（不改基础任务）
+        self.assertEqual(w.pending, [text + " 补充：错误码是 504"])
         self.assertEqual(len(self.pool.workers), 1)  # 没有多开 Worker
+
+    def test_reuse_consumes_pending_and_resumes_context(self):
+        """直达消息必须真的被执行：复用 run 消费 pending，并接在已有 history 后面。"""
+        with tmpdir() as d:
+            cfg = make_cfg(max_workers=2)
+            cfg.db_path = str(__import__("pathlib").Path(d) / "h.sqlite3")
+            cfg.artifact_dir = d
+            cfg.ensure_dirs()
+            llm = ScriptedLLM([{"text": "done"}], model_name="echo-llm")
+            agent = Agent(
+                router=Router(cfg, main=llm, utility=llm),
+                tools=default_registry(root=".", approval=lambda n, a: False, whitelist={"calculator"}),
+                cfg=cfg,
+            )
+            pool = WorkerPool(cfg, lambda: agent)
+            try:
+                router = TaskRouter(cfg, pool, MessageFilter(cfg, router=None))
+                text = "帮我排查 api_client.py 超时失败的问题"
+                d1 = router.route(text)
+                d2 = router.route(text + " 补充：错误码是 504")
+                self.assertEqual((d1.action, d2.action), (NEW_WORKER, REUSE_WORKER))
+                w = pool.workers[d1.worker_id]
+                w.run()
+                w.run(resume=True)
+                self.assertEqual(w.pending, [])  # 直达消息已被消费，不是躺在队列里
+                seen = llm.seen[-1]
+                self.assertTrue(any("504" in (m.content or "") for m in seen))
+                # 第二轮上下文里带着第一轮的 assistant 回答 -> 是续跑，不是重开
+                self.assertGreater(len(seen), 2)
+                self.assertEqual(w.status, "done")
+            finally:
+                pool.close()
+                agent.close()
 
     def test_explicit_split_not_counted_as_proactive(self):
         d = self.router.route("请把它们拆成三个子任务并行处理，每个子任务独立跑")

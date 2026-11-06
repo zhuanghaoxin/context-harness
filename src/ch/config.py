@@ -23,6 +23,38 @@ def _bool(v: str) -> bool:
     return v.strip().lower() not in ("", "0", "false", "no", "off")
 
 
+class ConfigError(ValueError):
+    """配置非法。带上变量名和原值，别让 int() 的报错裸奔到用户面前。"""
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ConfigError(f"{name}={raw!r} 不是合法整数") from None
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name}={value} 必须 >= {minimum}")
+    return value
+
+
+def _env_float(name: str, default: float, lo: float | None = None, hi: float | None = None) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        raise ConfigError(f"{name}={raw!r} 不是合法浮点数") from None
+    if lo is not None and value < lo:
+        raise ConfigError(f"{name}={value} 必须 >= {lo}")
+    if hi is not None and value > hi:
+        raise ConfigError(f"{name}={value} 必须 <= {hi}")
+    return value
+
+
 @dataclass
 class Config:
     base_url: str = ""
@@ -83,31 +115,60 @@ class Config:
     def from_env() -> "Config":
         load_dotenv()
         g = os.environ.get
-        return Config(
+        cfg = Config(
             base_url=g("CH_BASE_URL", ""),
             api_key=g("CH_API_KEY", ""),
             model=g("CH_MODEL", ""),
             small_model=g("CH_SMALL_MODEL", "") or g("CH_MODEL", ""),
-            max_steps=int(g("CH_MAX_STEPS", "16")),
-            context_budget=int(g("CH_CONTEXT_BUDGET", "8000")),
+            max_steps=_env_int("CH_MAX_STEPS", 16, minimum=1),
+            context_budget=_env_int("CH_CONTEXT_BUDGET", 8000, minimum=256),
             db_path=g("CH_DB_PATH", ".artifacts/harness.sqlite3"),
             artifact_dir=g("CH_ARTIFACT_DIR", ".artifacts"),
             filter_enabled=_bool(g("CH_FILTER_ENABLED", "1")),
-            filter_high=float(g("CH_FILTER_HIGH", "0.70")),
-            filter_low=float(g("CH_FILTER_LOW", "0.30")),
-            max_workers=int(g("CH_MAX_WORKERS", "4")),
-            worker_reuse_threshold=float(g("CH_WORKER_REUSE", "0.35")),
-            watchdog_stall_steps=int(g("CH_WATCHDOG_STALL", "3")),
-            watchdog_topic_floor=float(g("CH_WATCHDOG_TOPIC", "0.15")),
-            watchdog_min_text=int(g("CH_WATCHDOG_MIN_TEXT", "40")),
-            sim_latency_s=float(g("CH_SIM_LATENCY_MS", "0")) / 1000.0,
+            filter_high=_env_float("CH_FILTER_HIGH", 0.70, 0.0, 1.0),
+            filter_low=_env_float("CH_FILTER_LOW", 0.30, 0.0, 1.0),
+            max_workers=_env_int("CH_MAX_WORKERS", 4, minimum=1),
+            worker_reuse_threshold=_env_float("CH_WORKER_REUSE", 0.35, 0.0, 1.0),
+            watchdog_stall_steps=_env_int("CH_WATCHDOG_STALL", 3, minimum=1),
+            watchdog_topic_floor=_env_float("CH_WATCHDOG_TOPIC", 0.15, 0.0, 1.0),
+            watchdog_min_text=_env_int("CH_WATCHDOG_MIN_TEXT", 40, minimum=1),
+            sim_latency_s=_env_float("CH_SIM_LATENCY_MS", 0.0, 0.0) / 1000.0,
             embedding_model=g("CH_EMBEDDING_MODEL", ""),
-            embedding_dim=int(g("CH_EMBEDDING_DIM", "512")),
+            embedding_dim=_env_int("CH_EMBEDDING_DIM", 512, minimum=1),
             embedding_base_url=g("CH_EMBEDDING_BASE_URL", ""),
             embedding_api_key=g("CH_EMBEDDING_API_KEY", ""),
             embedding_cache_path=g("CH_EMBEDDING_CACHE", ".artifacts/embedding_cache.sqlite3"),
-            embedding_timeout=float(g("CH_EMBEDDING_TIMEOUT", "30")),
+            embedding_timeout=_env_float("CH_EMBEDDING_TIMEOUT", 30.0, 0.1),
         )
+        return cfg.validate()
+
+    def validate(self) -> "Config":
+        """字段级校验：一次性报出所有非法项，而不是撞到哪个崩哪个。"""
+        problems: list[str] = []
+        if self.max_steps < 1:
+            problems.append(f"max_steps={self.max_steps} 必须 >= 1")
+        if self.context_budget < 256:
+            problems.append(f"context_budget={self.context_budget} 太小（>= 256）")
+        if self.max_workers < 1:
+            problems.append(f"max_workers={self.max_workers} 必须 >= 1")
+        if self.queue_factor < 1:
+            problems.append(f"queue_factor={self.queue_factor} 必须 >= 1")
+        total = self.tool_share + self.history_share + self.memory_share
+        if not 0.99 <= total <= 1.01:
+            problems.append(f"预算比例之和 {total:.3f} 应约等于 1.0")
+        if not 0.0 <= self.filter_low < self.filter_high <= 1.0:
+            problems.append(
+                f"filter_low={self.filter_low} 必须 < filter_high={self.filter_high}（且都在 [0,1]）"
+            )
+        if not 0.0 <= self.worker_reuse_threshold <= 1.0:
+            problems.append(f"worker_reuse_threshold={self.worker_reuse_threshold} 必须在 [0,1]")
+        if self.embedding_dim < 1:
+            problems.append(f"embedding_dim={self.embedding_dim} 必须 >= 1")
+        if self.embedding_timeout <= 0:
+            problems.append(f"embedding_timeout={self.embedding_timeout} 必须 > 0")
+        if problems:
+            raise ConfigError("配置校验失败：" + "；".join(problems))
+        return self
 
     def ensure_dirs(self) -> None:
         Path(self.artifact_dir).mkdir(parents=True, exist_ok=True)

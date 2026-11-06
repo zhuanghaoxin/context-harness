@@ -19,7 +19,10 @@ import urllib.request
 from typing import Any, Protocol, Sequence
 
 from .config import Config
+from .log import get_logger
 from .types import LLMResponse, Message, ToolCall, Usage
+
+log = get_logger("llm")
 
 
 class LLM(Protocol):
@@ -90,7 +93,11 @@ class OpenAICompatLLM:
                 if not e.retryable or attempt >= self.retries:
                     raise
                 # 指数退避：0.5s → 1s → 2s ...，封顶 max_backoff_s
-                time.sleep(min(self.max_backoff_s, self.backoff_s * (2 ** attempt)))
+                delay = min(self.max_backoff_s, self.backoff_s * (2 ** attempt))
+                log.warning(
+                    "LLM 第 %d/%d 次重试（%.2fs 后）：%s", attempt + 1, self.retries, delay, e,
+                )
+                time.sleep(delay)
         raise last or LLMError("LLM 调用失败（未知原因）")
 
     def _send(self, req: urllib.request.Request) -> LLMResponse:

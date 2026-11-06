@@ -118,8 +118,10 @@ class Worker:
         self.error = ""
         self.created_ts = time.time()
         self.messages: list[str] = []  # 后续直达消息，用于衡量"消息直达"收益
+        self.pending: list[str] = []  # 已直达、还没被消费的补充消息（按序消费，不丢不重）
         self.reserved = False  # 已被 Router 认领，避免两条消息抢同一个 Worker
         self.vec = vec  # 任务向量，由 WorkerPool 用同一个 embedder 算，保证可比
+        self._run_lock = threading.Lock()  # 同一个 Worker 上的多次运行必须串行
 
     def can_take(self, score: float, threshold: float) -> bool:
         """是否还是同一个话题。已完成的 Worker 不再接手。"""
@@ -128,23 +130,30 @@ class Worker:
         return score >= threshold
 
     def deliver(self, text: str) -> None:
-        """消息直达：追加到该 Worker 的话题里，不再经过 Router。"""
+        """消息直达：排进该 Worker 的待消费队列，下一次 run 接在已有上下文后面。
+
+        旧实现只把文本拼进 task，而 find_reusable 又跳过 running —— 这条分支永远
+        走不到；即便走到，消息也只会改任务文本、没有任何执行者。
+        """
         self.messages.append(text)
-        if self.messages:
-            self.task = f"{self.task}\n补充：{self.messages[-1]}"
+        self.pending.append(text)
 
     def run(self, resume: bool = False) -> RunResult:
-        self.reserved = False
-        self.status = "running"
-        try:
-            # run_id=self.id：Agent 的每步 checkpoint 都记在这个 id 下，
-            # 于是"续跑"只需要一个 worker_id，不需要别的状态传递。
-            self.result = self.agent.run(self.task, run_id=self.id, resume=resume)
-            self.status = "done"
-        except Exception as e:  # noqa: BLE001 - 一个 Worker 挂掉不能拖垮整批
-            self.error = f"{type(e).__name__}: {e}"
-            self.status = "failed"
-        return self.result  # type: ignore[return-value]
+        with self._run_lock:
+            self.reserved = False
+            self.status = "running"
+            extra = None
+            if resume and self.pending:
+                extra = self.pending.pop(0)
+            try:
+                # run_id=self.id：Agent 的每步 checkpoint 都记在这个 id 下，
+                # 于是"续跑"只需要一个 worker_id，不需要别的状态传递。
+                self.result = self.agent.run(self.task, run_id=self.id, resume=resume, extra=extra)
+                self.status = "done"
+            except Exception as e:  # noqa: BLE001 - 一个 Worker 挂掉不能拖垮整批
+                self.error = f"{type(e).__name__}: {e}"
+                self.status = "failed"
+            return self.result  # type: ignore[return-value]
 
     def to_state(self) -> dict[str, Any]:
         """可序列化的最小状态，用于存算分离（主进程只持 worker_id）。"""
@@ -229,8 +238,6 @@ class WorkerPool:
         best, best_score = None, 0.0
         query = self.embedder.embed(text)  # 只算一次，别在循环里重复调远端
         for w in self.active:
-            if w.status == "running":
-                continue
             if w.vec is None:
                 w.vec = self.embedder.embed(w.task)
             if not w.can_take(similarity(query, w.vec), threshold):
